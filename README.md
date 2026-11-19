@@ -2,6 +2,10 @@
 
 upflow is a portable Windows 11 app for getting videos ready to upload to TikTok. Drop in a clip or a batch and it exports MP4s locally on your PC.
 
+<p align="center">
+  <img src="upflow.gif" alt="Demo of converting videos in upflow" width="600">
+</p>
+
 ## Getting started
 
 1. Extract the portable ZIP and open `Upflow.exe`. Keep `ffmpeg.exe` and `ffprobe.exe` in the same folder.
