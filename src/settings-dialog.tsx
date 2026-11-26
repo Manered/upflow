@@ -1,8 +1,9 @@
 import * as Dialog from "@radix-ui/react-dialog";
+import * as Select from "@radix-ui/react-select";
 import * as Switch from "@radix-ui/react-switch";
-import { LoaderCircle, Minus, Monitor, Moon, Plus, Sun, X } from "lucide-react";
+import { Check, ChevronDown, LoaderCircle, Minus, Monitor, Moon, Plus, Sun, X } from "lucide-react";
 import { useRef, useState, type FocusEvent } from "react";
-import { desktop, failure, type Settings } from "./native";
+import { bitrateStepKbps, bitrateSteps, desktop, failure, type Settings } from "./native";
 import { Button } from "./ui";
 
 const themes = [
@@ -10,6 +11,9 @@ const themes = [
   { value: "light", name: "Light", icon: Sun },
   { value: "dark", name: "Dark", icon: Moon },
 ] as const;
+
+const bitrateFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
+const bitrateOptions = Array.from({ length: bitrateSteps }, (_, index) => (index + 1) * bitrateStepKbps);
 
 export function SettingsDialog({
   value,
@@ -28,59 +32,62 @@ export function SettingsDialog({
   const [draft, setDraft] = useState(value);
   const [threads, setThreads] = useState(String(value.threads));
   const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [browsing, setBrowsing] = useState(false);
   const [writing, setWriting] = useState(false);
+  const saved = useRef(value);
+  const desired = useRef(value);
   const saving = useRef(false);
   const outputButton = useRef<HTMLButtonElement>(null);
+  const busy = browsing || writing;
 
-  async function persist(next: Settings) {
+  async function persist() {
     if (saving.current) return;
     saving.current = true;
-    setBusy(true);
     setError("");
     setWriting(true);
-    const previous = draft;
-    setDraft(next);
     try {
-      const saved = await desktop.saveSettings(next);
-      setDraft(saved);
-      setThreads(String(saved.threads));
-      onSave(saved);
-    } catch (error) {
-      setDraft(previous);
-      setThreads(String(previous.threads));
-      setError(failure(error).message);
+      while (desired.current !== saved.current) {
+        const requested = desired.current;
+        try {
+          const result = await desktop.saveSettings(requested);
+          saved.current = requested;
+          onSave(result);
+        } catch (error) {
+          setError(failure(error).message);
+          if (desired.current === requested) desired.current = saved.current;
+        }
+      }
+      setDraft(saved.current);
+      setThreads(String(saved.current.threads));
     } finally {
       saving.current = false;
-      setBusy(false);
       setWriting(false);
     }
   }
 
-  function update<K extends keyof Settings>(key: K, val: Settings[K]) {
-    void persist({ ...draft, [key]: val });
+  function changeSettings(changes: Partial<Settings>) {
+    desired.current = { ...desired.current, ...changes };
+    setDraft(desired.current);
+    void persist();
+  }
+
+  function update<K extends keyof Settings>(key: K, value: Settings[K]) {
+    changeSettings({ [key]: value });
   }
 
   async function choose(kind: "outputDirectory" | "ffmpegPath") {
-    if (saving.current) return;
-    saving.current = true;
-    setBusy(true);
+    setBrowsing(true);
     setError("");
     try {
       const path = await (kind === "outputDirectory" ? desktop.chooseDirectory() : desktop.chooseFFmpeg());
-      saving.current = false;
       if (typeof path === "string") {
-        await persist({
-          ...draft,
-          [kind]: path,
-          useSourceDirectory: kind === "outputDirectory" ? false : draft.useSourceDirectory,
-        });
+        if (kind === "outputDirectory") changeSettings({ outputDirectory: path, useSourceDirectory: false });
+        else update("ffmpegPath", path);
       }
     } catch (error) {
       setError(failure(error).message);
     } finally {
-      saving.current = false;
-      setBusy(false);
+      setBrowsing(false);
     }
   }
 
@@ -100,7 +107,7 @@ export function SettingsDialog({
     <Dialog.Root
       open={open}
       onOpenChange={(next) => {
-        if (!saving.current) setOpen(next);
+        if (!saving.current && !browsing) setOpen(next);
       }}
     >
       <Dialog.Portal>
@@ -199,6 +206,51 @@ export function SettingsDialog({
             <section className="settings-group" aria-labelledby="encoder-settings">
               <h3 id="encoder-settings">Encoder</h3>
               <div className="setting-row">
+                <label className="setting-label" htmlFor="video-bitrate">Video bitrate</label>
+                <Select.Root
+                  value={String(draft.videoBitrateKbps)}
+                  disabled={browsing}
+                  onValueChange={(kbps) => update("videoBitrateKbps", Number(kbps))}
+                >
+                  <Select.Trigger id="video-bitrate" className="bitrate-picker">
+                    <Select.Value />
+                    <Select.Icon asChild><ChevronDown /></Select.Icon>
+                  </Select.Trigger>
+                  <Select.Portal>
+                    <Select.Content
+                      className="bitrate-menu"
+                      position="popper"
+                      align="end"
+                      sideOffset={6}
+                      collisionPadding={10}
+                    >
+                      <Select.Viewport className="bitrate-options">
+                        {bitrateOptions.map((kbps) => (
+                          <Select.Item key={kbps} value={String(kbps)} className="bitrate-option">
+                            <Select.ItemText>{bitrateFormat.format(kbps / 1000)} Mbps</Select.ItemText>
+                            <Select.ItemIndicator asChild><Check /></Select.ItemIndicator>
+                          </Select.Item>
+                        ))}
+                      </Select.Viewport>
+                    </Select.Content>
+                  </Select.Portal>
+                </Select.Root>
+              </div>
+              <Toggle
+                id="gpu-encoding"
+                label="GPU encoding"
+                checked={draft.gpuEncoding}
+                disabled={busy}
+                onChange={(checked) => update("gpuEncoding", checked)}
+              />
+              <Toggle
+                id="gpu-decoding"
+                label="GPU decoding"
+                checked={draft.gpuDecoding}
+                disabled={busy}
+                onChange={(checked) => update("gpuDecoding", checked)}
+              />
+              <div className="setting-row">
                 <label className="setting-label" htmlFor="threads">
                   CPU threads
                 </label>
@@ -235,6 +287,9 @@ export function SettingsDialog({
                   </Button>
                 </div>
               </div>
+            </section>
+            <section className="settings-group" aria-labelledby="advanced-settings">
+              <h3 id="advanced-settings">Advanced</h3>
               <div className="setting-row setting-row-with-value">
                 <div className="setting-copy">
                   <span className="setting-label">FFmpeg executable</span>

@@ -6,6 +6,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub(crate) const DEFAULT_VIDEO_BITRATE_KBPS: u32 = 16_617;
+const VIDEO_BITRATE_STEPS: u32 = 7;
+const MAX_VIDEO_BITRATE_KBPS: u32 = DEFAULT_VIDEO_BITRATE_KBPS * VIDEO_BITRATE_STEPS;
+
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
@@ -22,6 +26,9 @@ pub struct Settings {
     pub output_directory: Option<PathBuf>,
     pub use_source_directory: bool,
     pub threads: u16,
+    pub gpu_decoding: bool,
+    pub gpu_encoding: bool,
+    pub video_bitrate_kbps: u32,
     pub open_folder_after_conversion: bool,
     pub keep_logs: bool,
     pub ffmpeg_path: Option<PathBuf>,
@@ -34,6 +41,9 @@ impl Default for Settings {
             output_directory: None,
             use_source_directory: true,
             threads: 16,
+            gpu_decoding: true,
+            gpu_encoding: true,
+            video_bitrate_kbps: DEFAULT_VIDEO_BITRATE_KBPS,
             open_folder_after_conversion: false,
             keep_logs: false,
             ffmpeg_path: None,
@@ -50,6 +60,12 @@ impl Settings {
         if !(1..=256).contains(&settings.threads) {
             settings.threads = 16;
         }
+        let step = settings
+            .video_bitrate_kbps
+            .saturating_add(DEFAULT_VIDEO_BITRATE_KBPS / 2)
+            / DEFAULT_VIDEO_BITRATE_KBPS;
+        settings.video_bitrate_kbps =
+            step.clamp(1, VIDEO_BITRATE_STEPS) * DEFAULT_VIDEO_BITRATE_KBPS;
         let has_valid_output_directory = settings
             .output_directory
             .as_ref()
@@ -69,6 +85,7 @@ impl Settings {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), Error> {
+        self.validate_video_bitrate()?;
         if !(1..=256).contains(&self.threads) {
             return Err(Error::new(
                 "settings",
@@ -100,6 +117,22 @@ impl Settings {
             ));
         }
         self.write(path)
+    }
+
+    pub(crate) fn validate_video_bitrate(&self) -> Result<(), Error> {
+        if (DEFAULT_VIDEO_BITRATE_KBPS..=MAX_VIDEO_BITRATE_KBPS).contains(&self.video_bitrate_kbps)
+            && self
+                .video_bitrate_kbps
+                .is_multiple_of(DEFAULT_VIDEO_BITRATE_KBPS)
+        {
+            Ok(())
+        } else {
+            Err(Error::new(
+                "settings",
+                "Choose one of the seven bitrate options.",
+                "",
+            ))
+        }
     }
 
     fn write(&self, path: &Path) -> Result<(), Error> {

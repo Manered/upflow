@@ -3,28 +3,50 @@ import {
   desktop,
   failure,
   type Failure,
+  type FrameSize,
   type Media,
   type Output,
   type Progress,
   type Settings,
   type Update,
 } from "./native";
+import { QueuePace } from "./queue-progress";
+import { readQueue, writeQueue } from "./saved-queue";
 
-type JobStatus = "pending" | "checking" | "ready" | "encoding" | "complete" | "failed" | "cancelled";
+type JobStatus =
+  | "pending" | "checking" | "needsResolution" | "ready" | "encoding"
+  | "complete" | "failed" | "cancelled" | "alreadyPatched";
 
 export type Job = {
   id: string;
   path: string;
   status: JobStatus;
   media?: Media;
+  frameSize?: FrameSize | null;
   output?: Output;
   issue?: Failure;
   progress?: Progress;
   finalizing?: boolean;
 };
 
-export function isFinished({ status }: Job) {
+export function isFinished({ status }: Pick<Job, "status">) {
   return status === "complete" || status === "failed" || status === "cancelled";
+}
+
+function canConvert({ status }: Job) {
+  return status === "pending" || status === "checking" || status === "ready";
+}
+
+export function needsFrameSize(job: Job) {
+  return job.status === "needsResolution" && !!job.media?.suggestedFrameSize;
+}
+
+export function matchesFrameSize(first: Job, second: Job) {
+  const a = first.media;
+  const b = second.media;
+  return a && b && needsFrameSize(second) && a.width === b.width && a.height === b.height
+    && a.suggestedFrameSize?.width === b.suggestedFrameSize?.width
+    && a.suggestedFrameSize?.height === b.suggestedFrameSize?.height;
 }
 
 export type Notify = (
@@ -38,25 +60,51 @@ export type JobLog = { lines: string[]; firstLine: number };
 const maxLogLines = 500;
 
 export function useQueue(notify: Notify, openLogs: (id: string) => void) {
-  const [jobs, setJobs] = useState<Job[]>([]);
+  const [jobs, setJobs] = useState<Job[]>(() =>
+    readQueue().map((item, index) => ({ ...item, id: String(index + 1), status: "pending" })),
+  );
   const [running, setRunning] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   // Native callbacks and the conversion loop read the latest queue between renders.
-  const jobsRef = useRef<Job[]>([]);
+  const jobsRef = useRef(jobs);
   const active = useRef<{ id: string; attempt: string } | null>(null);
+  const batch = useRef<{ onlyJobId?: string; settled: number; pace: QueuePace } | null>(null);
   const runningRef = useRef(false);
   const stopRequested = useRef(false);
   const inspectionTask = useRef<Promise<void> | null>(null);
-  const nextId = useRef(0);
+  const nextId = useRef(jobs.length);
+  const savedSnapshot = useRef("");
+  const saveErrorShown = useRef(false);
   const logs = useRef(new Map<string, JobLog>());
 
   function replaceJobs(update: (previous: Job[]) => Job[]) {
     jobsRef.current = update(jobsRef.current);
     setJobs(jobsRef.current);
+    const snapshot = JSON.stringify(jobsRef.current
+      .filter((job) => !isFinished(job))
+      .map(({ path, frameSize }) => ({ path, frameSize })));
+    if (snapshot === savedSnapshot.current) return;
+    try {
+      writeQueue(snapshot);
+      savedSnapshot.current = snapshot;
+      saveErrorShown.current = false;
+    } catch {
+      if (!saveErrorShown.current) notify("Could not save the queue for next time.", "error");
+      saveErrorShown.current = true;
+    }
   }
 
   function patch(id: string, changes: Partial<Job>) {
+    const currentBatch = batch.current;
+    if (
+      currentBatch &&
+      (!currentBatch.onlyJobId || currentBatch.onlyJobId === id) &&
+      changes.status && isFinished({ status: changes.status }) &&
+      jobsRef.current.some((job) => job.id === id && !isFinished(job))
+    ) {
+      currentBatch.settled++;
+    }
     replaceJobs((previous) => previous.map((job) => (job.id === id ? { ...job, ...changes } : job)));
   }
 
@@ -86,7 +134,12 @@ export function useQueue(notify: Notify, openLogs: (id: string) => void) {
     patch(job.id, { status: "checking", issue: undefined });
     try {
       const media = await desktop.inspect(job.path);
-      patch(job.id, { media, status: "ready" });
+      patch(job.id, {
+        media,
+        status: media.alreadyPatched ? "alreadyPatched"
+          : media.suggestedFrameSize && job.frameSize === undefined ? "needsResolution"
+          : "ready",
+      });
     } catch (error) {
       if (jobsRef.current.some((candidate) => candidate.id === job.id)) markFailed(job, failure(error));
     }
@@ -125,20 +178,21 @@ export function useQueue(notify: Notify, openLogs: (id: string) => void) {
     inspectPending();
   }
 
+  function forgetJobs(ids: string[]) {
+    if (!ids.length) return;
+    for (const id of ids) logs.current.delete(id);
+    void desktop.discardCheckpoints(ids).catch((error: unknown) => notify(failure(error).message, "error"));
+  }
+
   function remove(id: string) {
     if (active.current?.id === id) return;
-    replaceJobs((previous) => previous.filter((job) => job.id !== id));
-    logs.current.delete(id);
+    replaceJobs((jobs) => jobs.filter((job) => job.id !== id));
+    forgetJobs([id]);
   }
 
   function clearFinished() {
-    replaceJobs((previous) =>
-      previous.filter((job) => {
-        if (!isFinished(job)) return true;
-        logs.current.delete(job.id);
-        return false;
-      }),
-    );
+    forgetJobs(jobsRef.current.filter(isFinished).map(({ id }) => id));
+    replaceJobs((jobs) => jobs.filter((job) => !isFinished(job)));
   }
 
   function retry(id: string) {
@@ -149,20 +203,32 @@ export function useQueue(notify: Notify, openLogs: (id: string) => void) {
       issue: undefined,
       progress: undefined,
       finalizing: false,
-      status: job.media ? "ready" : "pending",
+      status: !job.media ? "pending"
+        : job.media.suggestedFrameSize && job.frameSize === undefined ? "needsResolution"
+        : "ready",
     });
     inspectPending();
   }
 
+  function chooseFrameSize(id: string, frameSize: FrameSize | null, applyToMatching: boolean) {
+    const job = jobsRef.current.find((candidate) => candidate.id === id);
+    if (!job || !needsFrameSize(job)) return;
+    replaceJobs((previous) => previous.map((candidate) => {
+      if (candidate.id === id || (applyToMatching && matchesFrameSize(job, candidate))) {
+        return { ...candidate, frameSize, status: "ready" };
+      }
+      return candidate;
+    }));
+  }
+
   function recheck() {
-    replaceJobs((previous) =>
-      previous.map((job) => {
-        if (job.status === "complete") return job;
-        const id = String(++nextId.current);
-        logs.current.delete(job.id);
-        return { id, path: job.path, status: "pending" };
-      }),
-    );
+    forgetJobs(jobsRef.current.filter((job) => job.status !== "complete").map(({ id }) => id));
+    replaceJobs((previous) => previous.map((job) => job.status === "complete" ? job : {
+      id: String(++nextId.current),
+      path: job.path,
+      frameSize: job.frameSize,
+      status: "pending",
+    }));
     inspectPending();
   }
 
@@ -171,13 +237,14 @@ export function useQueue(notify: Notify, openLogs: (id: string) => void) {
     if (
       runningRef.current ||
       !jobsRef.current.some(
-        (job) => matchesRequestedJob(job) && ["ready", "pending", "checking"].includes(job.status),
+        (job) => matchesRequestedJob(job) && canConvert(job),
       )
     ) {
       return;
     }
     runningRef.current = true;
     stopRequested.current = false;
+    batch.current = { onlyJobId, settled: 0, pace: new QueuePace() };
     setRunning(true);
     let completed = 0;
     let lastOutput: Output | undefined;
@@ -201,7 +268,7 @@ export function useQueue(notify: Notify, openLogs: (id: string) => void) {
         logs.current.delete(job.id);
         patch(job.id, { status: "encoding", issue: undefined, finalizing: false, progress: undefined });
         try {
-          const output = await desktop.convert(attempt, job.path, null);
+          const output = await desktop.convert(attempt, job.id, job.path, job.frameSize ?? null);
           patch(job.id, { output, status: "complete" });
           lastOutput = output;
           completed++;
@@ -210,6 +277,10 @@ export function useQueue(notify: Notify, openLogs: (id: string) => void) {
           if (issue.code === "cancelled") {
             patch(job.id, { status: "cancelled" });
             if (!stopRequested.current) notify("Conversion cancelled.");
+          } else if (issue.code === "alreadyPatched") {
+            if (job.media) {
+              patch(job.id, { status: "alreadyPatched", media: { ...job.media, alreadyPatched: true } });
+            }
           } else {
             markFailed(job, issue);
           }
@@ -221,6 +292,7 @@ export function useQueue(notify: Notify, openLogs: (id: string) => void) {
     } finally {
       if (stopRequested.current) notify("Queue stopped.");
       runningRef.current = false;
+      batch.current = null;
       stopRequested.current = false;
       setRunning(false);
       setStopping(false);
@@ -257,8 +329,29 @@ export function useQueue(notify: Notify, openLogs: (id: string) => void) {
     const current = active.current;
     if (!current || update.jobId !== current.attempt) return;
     if (update.type === "log") appendLog(current.id, update.line);
-    if (update.type === "progress") patch(current.id, { progress: update });
+    if (update.type === "progress") {
+      const job = jobsRef.current.find(({ id }) => id === current.id);
+      if (job) batch.current?.pace.record(job, update);
+      patch(current.id, { progress: update });
+    }
     if (update.type === "finalizing") patch(current.id, { finalizing: true });
+  }
+
+  const activeBatch = batch.current;
+  let batchProgress: number | null = null;
+  let queueTimeLeft: number | null = null;
+  if (activeBatch) {
+    const remaining = jobs.filter((job) =>
+      (!activeBatch.onlyJobId || activeBatch.onlyJobId === job.id) &&
+      (canConvert(job) || job.status === "encoding"),
+    );
+    if (!stopping) queueTimeLeft = activeBatch.pace.estimate(remaining);
+    const current = remaining.find((job) => job.status === "encoding");
+    const percent = current?.finalizing ? 100 : current?.progress?.percent;
+    const total = activeBatch.settled + remaining.length;
+    if (total && (activeBatch.settled || percent !== undefined)) {
+      batchProgress = Math.floor((activeBatch.settled * 100 + (percent ?? 0)) / total);
+    }
   }
 
   return {
@@ -267,12 +360,16 @@ export function useQueue(notify: Notify, openLogs: (id: string) => void) {
     runningRef,
     stopping,
     cancelling,
+    batchProgress,
+    queueTimeLeft,
     logs,
     add,
     remove,
     clearFinished,
     retry,
+    chooseFrameSize,
     recheck,
+    inspectPending,
     start,
     cancel,
     onUpdate,

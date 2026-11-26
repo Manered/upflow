@@ -1,14 +1,11 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import * as Tooltip from "@radix-ui/react-tooltip";
+import { ProgressBarStatus } from "@tauri-apps/api/window";
 import {
   ArrowRight,
   ArrowUpRight,
-  Check,
-  CircleAlert,
-  CircleSlash,
-  FileVideo,
   FolderOpen,
-  LoaderCircle,
+  Info,
   Minus,
   Play,
   Plus,
@@ -20,13 +17,16 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { fileLabel, fpsLabel, remainingLabel, sizeLabel, timeLabel } from "./format";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { fileLabel, remainingLabel, sizeLabel } from "./format";
 import { desktop, defaults, failure, windowApi, type Settings } from "./native";
+import { ExportDetails } from "./export-details";
 import { LogDialog, Notifications, useNotifications } from "./feedback";
-import { isFinished, useQueue, type Job } from "./queue";
+import { isFinished, matchesFrameSize, needsFrameSize, useQueue, type Job } from "./queue";
+import { QueueRow } from "./queue-row";
+import { ResolutionDialog } from "./resolution-dialog";
 import { SettingsDialog } from "./settings-dialog";
-import { Button } from "./ui";
+import { Button, Hint } from "./ui";
 
 const homeHeadlines = [
   "Patch your TikToks with upflow",
@@ -39,6 +39,7 @@ const homeHeadlines = [
 export function App() {
   const { toasts, notify, dismiss } = useNotifications();
   const [logId, setLogId] = useState<string | null>(null);
+  const [detailsId, setDetailsId] = useState<string | null>(null);
   const queue = useQueue(notify, setLogId);
   const [settings, setSettings] = useState(defaults);
   const [settingsOpen, setSettingsOpen] = useState<"general" | "output" | null>(null);
@@ -50,12 +51,18 @@ export function App() {
   const pickerOpen = useRef(false);
   const modalOpenRef = useRef(false);
   const settingsButton = useRef<HTMLButtonElement>(null);
+  const convertButton = useRef<HTMLButtonElement>(null);
 
   const activeJob = queue.jobs.find(({ status }) => status === "encoding");
   const pendingCount = queue.jobs.filter(
     ({ status }) => status === "pending" || status === "checking" || status === "ready",
   ).length;
-  const modalOpen = !!(settingsOpen || logId || closePrompt);
+  const inspecting = queue.jobs.some(({ status }) => status === "pending" || status === "checking");
+  const resolutionJob = !queue.running && !inspecting && !picking && !settingsOpen && !logId && !detailsId && !closePrompt
+    ? queue.jobs.find(needsFrameSize)
+    : undefined;
+  const resolution = resolutionJob?.media?.suggestedFrameSize;
+  const modalOpen = !!(settingsOpen || logId || detailsId || closePrompt || resolution);
   modalOpenRef.current = modalOpen;
 
   function windowAction(action: Promise<unknown>) {
@@ -65,6 +72,7 @@ export function App() {
   function closeRequested() {
     if (queue.runningRef.current) {
       setLogId(null);
+      setDetailsId(null);
       setClosePrompt(true);
     } else {
       windowAction(desktop.confirmClose());
@@ -91,12 +99,13 @@ export function App() {
   // Keep event listeners registered once while giving them the latest callbacks.
   const handlers = useRef({
     update: queue.onUpdate,
+    inspect: queue.inspectPending,
     add: queue.add,
     closeRequested,
     pick: pickVideos,
     notify,
   });
-  handlers.current = { update: queue.onUpdate, add: queue.add, closeRequested, pick: pickVideos, notify };
+  handlers.current = { update: queue.onUpdate, inspect: queue.inspectPending, add: queue.add, closeRequested, pick: pickVideos, notify };
 
   useEffect(() => {
     let mounted = true;
@@ -125,7 +134,10 @@ export function App() {
         if (mounted) setSettings({ ...defaults, ...value });
       }),
       Promise.all([update, close]).then(() => {
-        if (mounted) setConnected(true);
+        if (mounted) {
+          setConnected(true);
+          handlers.current.inspect();
+        }
       }),
       drag,
       resize,
@@ -158,6 +170,15 @@ export function App() {
     return () => color.removeEventListener("change", apply);
   }, [settings.theme]);
 
+  const { running, batchProgress } = queue;
+  useEffect(() => {
+    if (!connected) return;
+    const status = !running ? ProgressBarStatus.None
+      : batchProgress === null ? ProgressBarStatus.Indeterminate
+      : ProgressBarStatus.Normal;
+    void windowApi.setProgressBar({ status, progress: batchProgress ?? 0 }).catch(() => {});
+  }, [connected, running, batchProgress]);
+
   function saveSettings(value: Settings) {
     setSettings(value);
     if (value.ffmpegPath !== settings.ffmpegPath) queue.recheck();
@@ -174,8 +195,15 @@ export function App() {
 
   const queued = queue.jobs.filter((item) => !isFinished(item));
   const finished = queue.jobs.filter(isFinished);
+  const estimate = queue.running || inspecting ? 0 : queued.reduce((bytes, { media, status }) => {
+    if (!media || status === "alreadyPatched") return bytes;
+    const audioKbps = media.audioCodec ? 160 : 0;
+    return bytes + (settings.videoBitrateKbps + audioKbps) * 125 * media.duration;
+  }, 0);
   const logTrigger = useRef<HTMLElement | null>(null);
   const logJob = queue.jobs.find(({ id }) => id === logId);
+  const detailsJob = queue.jobs.find(({ id }) => id === detailsId);
+  const detailsTrigger = useRef<HTMLButtonElement | null>(null);
 
   function renderQueueRow(item: Job) {
     const hasLogs = item.status === "encoding" || queue.logs.current.has(item.id);
@@ -230,6 +258,20 @@ export function App() {
               </Button>
             </Hint>
           </>
+        )}
+        {output && (
+          <Hint label="Export details">
+            <Button
+              variant="icon"
+              aria-label="Export details"
+              onClick={(event) => {
+                detailsTrigger.current = event.currentTarget;
+                setDetailsId(item.id);
+              }}
+            >
+              <Info />
+            </Button>
+          </Hint>
         )}
         {hasLogs && (
           <Hint label="Logs">
@@ -380,6 +422,10 @@ export function App() {
 
         <footer className="footer">
           <div className="footer-content">
+            {queue.queueTimeLeft !== null && (
+              <span className="queue-eta">{remainingLabel(queue.queueTimeLeft)} left</span>
+            )}
+            {estimate > 0 && <span className="queue-eta" title="Estimated total export size">Est. {sizeLabel(estimate)}</span>}
             <div className="inline-actions">
               {queue.running ? (
                 <>
@@ -399,8 +445,9 @@ export function App() {
                 </>
               ) : (
                 <Button
+                  ref={convertButton}
                   variant="primary"
-                  disabled={!pendingCount || !connected}
+                  disabled={!pendingCount || !connected || inspecting || Boolean(resolutionJob)}
                   onClick={() => void queue.start(settings)}
                 >
                   {pendingCount > 1 ? `Convert ${pendingCount} files` : "Convert"}
@@ -421,6 +468,17 @@ export function App() {
             returnFocus={() => settingsButton.current?.focus()}
           />
         )}
+        {detailsJob?.output && (
+          <ExportDetails
+            key={detailsJob.id}
+            output={detailsJob.output}
+            onClose={() => setDetailsId(null)}
+            returnFocus={() => {
+              if (detailsTrigger.current?.isConnected) detailsTrigger.current.focus();
+              detailsTrigger.current = null;
+            }}
+          />
+        )}
         {logJob && (
           <LogDialog
             key={logJob.id}
@@ -432,6 +490,21 @@ export function App() {
               logTrigger.current = null;
             }}
             onCopy={(value) => void copy(value, "Logs copied.")}
+          />
+        )}
+        {resolutionJob?.media && resolution && (
+          <ResolutionDialog
+            key={resolutionJob.id}
+            media={resolutionJob.media}
+            suggested={resolution}
+            matching={queue.jobs.filter((job) => matchesFrameSize(resolutionJob, job)).length}
+            onChoose={(size, all) => {
+              queue.chooseFrameSize(resolutionJob.id, size, all);
+              const remaining = queue.jobs.some((job) =>
+                job.id !== resolutionJob.id && needsFrameSize(job) && (!all || !matchesFrameSize(resolutionJob, job)),
+              );
+              if (!remaining) requestAnimationFrame(() => convertButton.current?.focus());
+            }}
           />
         )}
         <Dialog.Root open={closePrompt} onOpenChange={setClosePrompt}>
@@ -457,121 +530,5 @@ export function App() {
         </Dialog.Root>
       </div>
     </Tooltip.Provider>
-  );
-}
-
-function Hint({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <Tooltip.Root>
-      <Tooltip.Trigger asChild>{children}</Tooltip.Trigger>
-      <Tooltip.Portal>
-        <Tooltip.Content className="tooltip" side="bottom" sideOffset={7}>
-          {label}
-        </Tooltip.Content>
-      </Tooltip.Portal>
-    </Tooltip.Root>
-  );
-}
-
-function QueueRow({ item, children }: { item: Job; children: ReactNode }) {
-  const encoding = item.status === "encoding";
-  const progress = encoding ? item.progress : undefined;
-  const name = item.output?.name ?? item.media?.name ?? fileLabel(item.path);
-  const metadata = item.media
-    ? [`${item.media.width} × ${item.media.height}`, fpsLabel(item.media.fps), timeLabel(item.media.duration)]
-    : [];
-  if (item.output) metadata.push(sizeLabel(item.output.size));
-  const checking = item.status === "pending" || item.status === "checking";
-  const status = item.status === "pending" ? "Waiting to check file" : "Checking file";
-  const phase = item.finalizing
-    ? "Checking output"
-    : progress
-      ? `Pass ${progress.pass} of 2`
-      : "Starting conversion";
-  const percent = item.finalizing ? 100 : Math.floor(progress?.percent ?? 0);
-
-  return (
-    <li className={"queue-row"}>
-      <div className="queue-item">
-        <div className="file-summary">
-          <span className="file-icon">
-            <FileVideo />
-          </span>
-          <div className="file-copy">
-            <div className="file-title">
-              <strong className="truncate" title={item.output?.path ?? item.path}>
-                {name}
-              </strong>
-              {(checking || encoding) && (
-                <span className="file-status" role="status" aria-label={checking ? status : phase}>
-                  <LoaderCircle className="spinner" aria-hidden="true" />
-                </span>
-              )}
-              {(item.status === "ready" || item.status === "complete") && (
-                <Hint label={item.status === "ready" ? "Ready" : "Exported"}>
-                  <span
-                    className="file-status"
-                    tabIndex={0}
-                    role="img"
-                    aria-label={item.status === "ready" ? "Ready" : "Exported"}
-                  >
-                    <Check />
-                  </span>
-                </Hint>
-              )}
-              {item.status === "cancelled" && (
-                <Hint label="Cancelled">
-                  <span className="file-status" tabIndex={0} role="img" aria-label="Cancelled">
-                    <CircleSlash />
-                  </span>
-                </Hint>
-              )}
-              {item.status === "failed" && (
-                <Hint label="Failed">
-                  <span className="file-status is-error" tabIndex={0} role="img" aria-label="Failed">
-                    <CircleAlert />
-                  </span>
-                </Hint>
-              )}
-            </div>
-            {metadata.length > 0 ? (
-              <div className="file-meta">
-                {metadata.map((value) => (
-                  <span key={value}>{value}</span>
-                ))}
-              </div>
-            ) : (
-              checking && (
-                <div className="metadata-skeleton" aria-hidden="true">
-                  <i />
-                  <i />
-                  <i />
-                </div>
-              )
-            )}
-          </div>
-        </div>
-        <div className="row-actions">{children}</div>
-      </div>
-      {item.issue && <p className="row-issue">{item.issue.message}</p>}
-      {encoding && (
-        <div className="row-progress">
-          <div className="progress-timing">
-            <span>{phase}</span>
-            <span className="progress-stats">
-              {!item.finalizing && progress?.remaining != null && (
-                <span>{remainingLabel(progress.remaining)} left</span>
-              )}
-              {(progress || item.finalizing) && <strong>{percent}%</strong>}
-            </span>
-          </div>
-          <progress
-            max={100}
-            value={progress || item.finalizing ? percent : undefined}
-            aria-label="Overall conversion progress"
-          />
-        </div>
-      )}
-    </li>
   );
 }

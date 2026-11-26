@@ -1,4 +1,5 @@
-import { forwardRef, type ButtonHTMLAttributes } from "react";
+import * as Tooltip from "@radix-ui/react-tooltip";
+import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { clsx } from "clsx";
 
 type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
@@ -11,3 +12,16 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
   ),
 );
 Button.displayName = "Button";
+
+export function Hint({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <Tooltip.Root>
+      <Tooltip.Trigger asChild>{children}</Tooltip.Trigger>
+      <Tooltip.Portal>
+        <Tooltip.Content className="tooltip" side="bottom" sideOffset={7}>
+          {label}
+        </Tooltip.Content>
+      </Tooltip.Portal>
+    </Tooltip.Root>
+  );
+}

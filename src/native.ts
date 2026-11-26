@@ -8,26 +8,37 @@ export type Settings = {
   outputDirectory: string | null;
   useSourceDirectory: boolean;
   threads: number;
+  gpuDecoding: boolean;
+  gpuEncoding: boolean;
+  videoBitrateKbps: number;
   openFolderAfterConversion: boolean;
   keepLogs: boolean;
   ffmpegPath: string | null;
 };
+
+export const bitrateStepKbps = 16_617;
+export const bitrateSteps = 7;
 
 export const defaults: Settings = {
   theme: "system",
   outputDirectory: null,
   useSourceDirectory: true,
   threads: 16,
+  gpuDecoding: true,
+  gpuEncoding: true,
+  videoBitrateKbps: bitrateStepKbps,
   openFolderAfterConversion: false,
   keepLogs: false,
   ffmpegPath: null,
 };
 
-export type Media = {
+export type FrameSize = { width: number; height: number };
+
+export type Media = FrameSize & {
   path: string;
   name: string;
-  width: number;
-  height: number;
+  alreadyPatched: boolean;
+  suggestedFrameSize: FrameSize | null;
   fps: number;
   duration: number;
   size: number;
@@ -38,13 +49,24 @@ export type Media = {
   container: string;
 };
 
-export type Output = { path: string; name: string; size: number; directory: string };
+export type AudioPatch = "applied" | "noAudio" | "needsStereo" | "tooShort";
+export type Output = {
+  path: string;
+  name: string;
+  size: number;
+  directory: string;
+  audioPatch: AudioPatch;
+  encoder: "libx264" | "h264_nvenc" | "h264_mf";
+  decoder: "cpu" | "d3d11va" | "cuda";
+};
 export type Progress = {
-  pass: number;
+  pass: 1 | 2;
+  passes: 1 | 2;
   percent: number;
   passPercent: number;
   elapsed: number;
-  remaining: number | null;
+  speed: number | null;
+  encoder: string;
 };
 export type Update = { jobId: string } & (
   ({ type: "progress" } & Progress) | { type: "log"; line: string } | { type: "finalizing" }
@@ -64,8 +86,9 @@ export const desktop = {
   settings: () => invoke<Settings>("get_settings"),
   saveSettings: (value: Settings) => invoke<Settings>("save_settings", { value }),
   inspect: (path: string) => invoke<Media>("inspect_media", { path }),
-  convert: (jobId: string, path: string, directory: string | null) =>
-    invoke<Output>("start_conversion", { jobId, path, directory }),
+  convert: (jobId: string, queueId: string, path: string, frameSize: FrameSize | null) =>
+    invoke<Output>("start_conversion", { jobId, queueId, path, frameSize }),
+  discardCheckpoints: (queueIds: string[]) => invoke<void>("discard_checkpoints", { queueIds }),
   cancel: (jobId: string) => invoke<void>("cancel_conversion", { jobId }),
   openFolder: (path: string) => invoke<void>("open_directory", { path }),
   openResult: (path: string, reveal: boolean) => invoke<void>("open_result", { path, reveal }),

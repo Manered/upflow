@@ -63,10 +63,10 @@ foreach ($required in @(
     }
 }
 
-foreach ($archive in @("ffmpeg-*.tar.gz", "x264-*.tar.gz")) {
+foreach ($archive in @("ffmpeg-*.tar.gz", "x264-*.tar.gz", "nv-codec-headers-*.tar.gz")) {
     $files = @(Get-ChildItem (Join-Path $MediaTools "source") -File -Filter $archive)
     if ($files.Count -ne 1) {
-        throw "Expected one corresponding source archive matching $archive."
+        throw "Expected one source archive matching $archive. Rebuild the tools with scripts/build-media-tools.sh."
     }
 }
 

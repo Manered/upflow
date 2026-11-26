@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::{path::PathBuf, sync::Mutex};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tokio_util::sync::CancellationToken;
-use upflow_engine::{Conversion, Error, Event, Media, Output, Settings, Tools};
+use upflow_engine::{
+    Conversion, Error, Event, FrameSize, Media, Output, PassCheckpoint, Settings, Tools,
+};
 
 struct Application {
     data_directory: PathBuf,
@@ -18,6 +20,7 @@ struct Activity {
     conversion: Option<(String, CancellationToken)>,
     pending_cancellation: Option<String>,
     inspection: Option<CancellationToken>,
+    checkpoints: HashMap<String, PassCheckpoint>,
     closing: bool,
 }
 
@@ -67,15 +70,16 @@ async fn inspect_media(path: PathBuf, state: State<'_, Application>) -> Result<M
 #[tauri::command]
 async fn start_conversion(
     job_id: String,
+    queue_id: String,
     path: PathBuf,
-    directory: Option<PathBuf>,
+    frame_size: Option<FrameSize>,
     app: AppHandle,
     state: State<'_, Application>,
 ) -> Result<Output, Error> {
     let settings = state.snapshot();
     let tools = Tools::locate(&settings)?;
     let cancel = CancellationToken::new();
-    {
+    let mut checkpoint = {
         let mut activity = state.activity.lock().expect("activity lock");
         if activity.closing || activity.conversion.is_some() {
             return Err(Error::new("busy", "A conversion is already running.", ""));
@@ -87,31 +91,52 @@ async fn start_conversion(
             cancel.cancel();
         }
         activity.conversion = Some((job_id.clone(), cancel.clone()));
-    }
+        activity.checkpoints.remove(&queue_id)
+    };
     let conversion = Conversion {
         source: path,
-        directory,
+        directory: None,
+        frame_size,
         settings,
         log_directory: state.data_directory.join("logs"),
         tools,
     };
-    let result = upflow_engine::convert(conversion, cancel, |event| {
-        let update = Update {
-            job_id: job_id.clone(),
-            event,
-        };
-        let _ = app.emit_to("main", "conversion-update", update);
-    })
+    let result = upflow_engine::convert_with_retry(
+        conversion,
+        cancel,
+        |event| {
+            let update = Update {
+                job_id: job_id.clone(),
+                event,
+            };
+            let _ = app.emit_to("main", "conversion-update", update);
+        },
+        &mut checkpoint,
+    )
     .await;
     let closing = {
         let mut activity = state.activity.lock().expect("activity lock");
         activity.conversion = None;
+        if !activity.closing {
+            if let Some(checkpoint) = checkpoint.take() {
+                activity.checkpoints.insert(queue_id, checkpoint);
+            }
+        }
         activity.closing
     };
+    drop(checkpoint);
     if closing {
         app.exit(0);
     }
     result
+}
+
+#[tauri::command]
+fn discard_checkpoints(queue_ids: Vec<String>, state: State<'_, Application>) {
+    let mut activity = state.activity.lock().expect("activity lock");
+    for id in queue_ids {
+        activity.checkpoints.remove(&id);
+    }
 }
 
 #[tauri::command]
@@ -167,6 +192,7 @@ fn confirm_close(app: AppHandle, state: State<'_, Application>) {
     let running = {
         let mut activity = state.activity.lock().expect("activity lock");
         activity.closing = true;
+        activity.checkpoints.clear();
         if let Some(inspection) = &activity.inspection {
             inspection.cancel();
         }
@@ -212,6 +238,7 @@ fn main() {
             inspect_media,
             start_conversion,
             cancel_conversion,
+            discard_checkpoints,
             open_directory,
             open_result,
             confirm_close,

@@ -1,11 +1,18 @@
+mod acceleration;
+mod checkpoint;
 mod encode;
 mod media;
 mod mp4;
+mod output;
 mod process;
+mod progress;
 mod settings;
 
-pub use encode::{convert, plan_outputs, Conversion, Event, Output};
-pub use media::{inspect, Media};
+pub use checkpoint::PassCheckpoint;
+pub use encode::{convert, convert_with_retry, Conversion};
+pub use media::{inspect, FrameSize, Media};
+pub use output::{plan_outputs, AudioPatch, Output};
+pub use progress::Event;
 pub use settings::{Settings, Theme};
 
 use serde::Serialize;

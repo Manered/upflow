@@ -1,3 +1,5 @@
+import type { FrameSize } from "./native";
+
 const decimal = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
 
 export function sizeLabel(bytes: number) {
@@ -30,4 +32,8 @@ export function remainingLabel(seconds: number) {
   const minutes = Math.floor(total / 60);
   if (minutes < 60) return `${minutes}m ${total % 60}s`;
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+export function frameSizeLabel({ width, height }: FrameSize) {
+  return `${width} × ${height}`;
 }

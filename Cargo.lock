@@ -4268,7 +4268,7 @@ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "upflow"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "tauri",
@@ -4281,11 +4281,12 @@ dependencies = [
 
 [[package]]
 name = "upflow-engine"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "fs2",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-util",

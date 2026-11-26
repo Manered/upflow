@@ -18,6 +18,7 @@ struct Stream {
     profile: Option<String>,
     width: u32,
     height: u32,
+    sample_aspect_ratio: Option<String>,
     avg_frame_rate: String,
     time_base: String,
     r_frame_rate: String,
@@ -52,6 +53,48 @@ struct Format {
     duration: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct FrameSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl FrameSize {
+    const SUPPORTED: [Self; 3] = [
+        Self {
+            width: 1920,
+            height: 1080,
+        },
+        Self {
+            width: 1080,
+            height: 1920,
+        },
+        Self {
+            width: 1080,
+            height: 1080,
+        },
+    ];
+
+    pub(crate) fn is_supported(self) -> bool {
+        Self::SUPPORTED.contains(&self)
+    }
+
+    fn recommended(self, display_ratio: f64) -> Option<Self> {
+        if self.is_supported() {
+            return None;
+        }
+        // At 4:3 and 3:4 the square and oriented frames use the same area for the picture.
+        let [landscape, portrait, square] = Self::SUPPORTED;
+        Some(if display_ratio >= 4.0 / 3.0 {
+            landscape
+        } else if display_ratio <= 3.0 / 4.0 {
+            portrait
+        } else {
+            square
+        })
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Media {
@@ -59,9 +102,11 @@ pub struct Media {
     pub name: String,
     pub width: u32,
     pub height: u32,
+    pub suggested_frame_size: Option<FrameSize>,
     pub fps: f64,
     pub duration: f64,
     pub size: u64,
+    pub already_patched: bool,
     pub video_codec: String,
     pub audio_codec: Option<String>,
     pub sample_rate: Option<u32>,
@@ -137,7 +182,7 @@ pub(crate) async fn probe(
                 "-format_whitelist",
                 LOCAL_FORMATS,
                 "-show_entries",
-                "stream=index,codec_type,codec_name,profile,width,height,avg_frame_rate,r_frame_rate,time_base,duration,start_time,nb_frames,bit_rate,sample_rate,channel_layout,pix_fmt,level:stream_disposition=attached_pic:stream_tags=DURATION:format=format_name,duration",
+                "stream=index,codec_type,codec_name,profile,width,height,sample_aspect_ratio,avg_frame_rate,r_frame_rate,time_base,duration,start_time,nb_frames,bit_rate,sample_rate,channel_layout,pix_fmt,level:stream_disposition=attached_pic:stream_tags=DURATION:format=format_name,duration",
                 "-of",
                 "json",
                 "-i",
@@ -175,6 +220,18 @@ pub(crate) async fn probe(
             ))
         }
     };
+    let sample_ratio = video
+        .sample_aspect_ratio
+        .as_deref()
+        .and_then(|ratio| ratio.split_once(':'))
+        .and_then(|(num, den)| Some(positive(Some(num))? / positive(Some(den))?))
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+        .unwrap_or(1.0);
+    let frame_size = FrameSize {
+        width: video.width,
+        height: video.height,
+    };
+    let display_ratio = sample_ratio * f64::from(video.width) / f64::from(video.height);
     Ok(Media {
         path: path.to_owned(),
         name: path
@@ -184,6 +241,7 @@ pub(crate) async fn probe(
             .into_owned(),
         width: video.width,
         height: video.height,
+        suggested_frame_size: frame_size.recommended(display_ratio),
         fps: frame_rate,
         duration,
         size: meta.len(),
@@ -195,6 +253,7 @@ pub(crate) async fn probe(
         frames: parse(video.nb_frames.as_deref()),
         bitrate: parse(video.bit_rate.as_deref()),
         video_index: video.index,
+        already_patched: false,
         audio_index: audio.map(|s| s.index),
         max_fps: fps(&video.r_frame_rate)
             .unwrap_or(frame_rate)
@@ -273,8 +332,21 @@ pub async fn inspect(
     tools: &Tools,
     cancel: &CancellationToken,
 ) -> Result<Media, Error> {
-    let media = probe(path, tools, cancel).await?;
-    crate::encode::level_for(&media)?;
+    let mut media = probe(path, tools, cancel).await?;
+    media.already_patched = detect_patch(&media.path, &media.container).await;
+    if media.already_patched {
+        return Ok(media);
+    }
+    if media.suggested_frame_size.is_none() {
+        crate::encode::level_for(
+            FrameSize {
+                width: media.width,
+                height: media.height,
+            },
+            media.max_fps,
+            crate::settings::DEFAULT_VIDEO_BITRATE_KBPS,
+        )?;
+    }
     // Catch missing decoders and inputs whose headers probe but whose frames cannot decode.
     let result = process::capture(
         process::command(&tools.ffmpeg)
@@ -315,6 +387,16 @@ pub async fn inspect(
         ));
     }
     Ok(media)
+}
+
+pub(crate) async fn detect_patch(path: &Path, container: &str) -> bool {
+    if !container.split(',').any(|name| name == "mp4") {
+        return false;
+    }
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || crate::mp4::is_patched(&path))
+        .await
+        .unwrap_or(false)
 }
 
 pub(crate) fn null_device() -> &'static str {
